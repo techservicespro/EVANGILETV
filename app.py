@@ -2,8 +2,6 @@ import re
 from urllib.parse import quote, unquote, urljoin
 from flask import Flask, Response, jsonify, request
 import requests
-import yt_dlp
-from yt_dlp.networking.impersonate import ImpersonateTarget
 
 app = Flask(__name__)
 
@@ -14,17 +12,17 @@ EVANGILE_API_URL = (
     "evangiletv/EvangileTV-website-web-1/live1/stream_info.php"
 )
 
-# --- CONFIGURATION EMCI TV (Dailymotion) ---
-EMCI_VIDEO_URL = "https://www.dailymotion.com/video/x8azdkm"
+# --- CONFIGURATION GABON 1ERE (Imnet) ---
+GABON1ERE_EMBED_URL = "https://connect.imnet.online/watch/gabon_1ere-54e2d65d?embed=1"
 
 PROFILES = {
     "evangile": {
         "Origin": "https://evangile.tv",
         "Referer": "https://evangile.tv/",
     },
-    "emci": {
-        "Origin": "https://www.dailymotion.com",
-        "Referer": "https://www.dailymotion.com/",
+    "gabon1ere": {
+        "Origin": "https://connect.imnet.online",
+        "Referer": "https://connect.imnet.online/watch/gabon_1ere-54e2d65d?embed=1",
     },
 }
 
@@ -75,32 +73,49 @@ def get_evangiletv_streams():
     return streams
 
 
-def get_emcitv_m3u8():
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "format": "best",
-        "impersonate": ImpersonateTarget("chrome"),
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(EMCI_VIDEO_URL, download=False)
-        if info.get("manifest_url"):
-            return info["manifest_url"]
-        if info.get("url") and ".m3u8" in info["url"]:
-            return info["url"]
-        for f in reversed(info.get("formats", [])):
-            if f.get("protocol") in ("m3u8", "m3u8_native") and f.get("url"):
-                return f["url"]
-    raise RuntimeError("Impossible d'extraire le flux m3u8 pour EMCITV.")
+def get_gabon1ere_m3u8():
+    headers = get_headers("gabon1ere", is_api=False)
+    headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    r = requests.get(GABON1ERE_EMBED_URL, headers=headers, timeout=10)
+    r.raise_for_status()
+
+    raw_html = r.text.replace("\\/", "/")
+    matches = list(
+        dict.fromkeys(re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', raw_html))
+    )
+    if not matches:
+        raise RuntimeError(
+            "Aucune URL .m3u8 trouvée directement dans le HTML de Gabon 1ère."
+        )
+    return matches[0]
 
 
 @app.route("/")
 @app.route("/ping")
 def index():
     return (
-        "Proxy Multi-Chaînes actif. Flux disponibles : "
-        "/EVANGILETV.m3u8, /EVANGILETV2.m3u8, /EMCITV.m3u8, /playlist.m3u"
+        "Proxy TV actif. Flux disponibles : "
+        "/EVANGILETV.m3u8, /EVANGILETV2.m3u8, /GABON1ERE.m3u8, /playlist.m3u"
     )
+
+
+@app.route("/debug/gabon1ere")
+def debug_gabon1ere():
+    try:
+        m3u8_url = get_gabon1ere_m3u8()
+        test = requests.get(
+            m3u8_url, headers=get_headers("gabon1ere", is_api=False), timeout=10
+        )
+        return jsonify(
+            {
+                "status": "ok",
+                "m3u8_url": m3u8_url,
+                "http_status": test.status_code,
+                "m3u8_preview": test.text[:350],
+            }
+        )
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e)}), 500
 
 
 @app.route("/playlist.m3u")
@@ -112,8 +127,8 @@ def playlist():
         f"{base_url}/EVANGILETV.m3u8",
         '#EXTINF:-1 tvg-id="EVANGILETV2" tvg-name="EVANGILETV (Flux 2)",EVANGILETV (Flux 2)',
         f"{base_url}/EVANGILETV2.m3u8",
-        '#EXTINF:-1 tvg-id="EMCITV" tvg-name="EMCI TV",EMCI TV',
-        f"{base_url}/EMCITV.m3u8",
+        '#EXTINF:-1 tvg-id="GABON1ERE" tvg-name="Gabon 1ère",Gabon 1ère',
+        f"{base_url}/GABON1ERE.m3u8",
     ]
     return Response("\n".join(lines) + "\n", mimetype="audio/x-mpegurl")
 
@@ -140,13 +155,13 @@ def evangiletv_2():
         return Response(f"Erreur EVANGILETV2 : {e}", status=502)
 
 
-@app.route("/EMCITV.m3u8")
-def emcitv():
+@app.route("/GABON1ERE.m3u8")
+def gabon1ere():
     try:
-        master_url = get_emcitv_m3u8()
-        return proxy_m3u8(master_url, profile="emci")
+        master_url = get_gabon1ere_m3u8()
+        return proxy_m3u8(master_url, profile="gabon1ere")
     except Exception as e:
-        return Response(f"Erreur EMCITV : {e}", status=502)
+        return Response(f"Erreur GABON1ERE : {e}", status=502)
 
 
 @app.route("/proxy")
