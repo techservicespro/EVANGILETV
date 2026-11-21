@@ -12,8 +12,8 @@ EVANGILE_API_URL = (
     "evangiletv/EvangileTV-website-web-1/live1/stream_info.php"
 )
 
-# --- CONFIGURATION GABON 1ERE (Imnet) ---
-GABON1ERE_EMBED_URL = "https://connect.imnet.online/watch/gabon_1ere-54e2d65d?embed=1"
+# --- CONFIGURATION GABON 1ERE (Imnet API JSON) ---
+GABON1ERE_API_URL = "https://connect.imnet.online/api/public/channel/gabon_1ere-54e2d65d"
 
 PROFILES = {
     "evangile": {
@@ -29,16 +29,19 @@ PROFILES = {
 
 def get_headers(profile="evangile", is_api=False):
     p = PROFILES.get(profile, PROFILES["evangile"])
-    return {
+    headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         ),
-        "Accept": "application/json, text/javascript, */*; q=0.01" if is_api else "*/*",
+        "Accept": "application/json, text/plain, */*" if is_api else "*/*",
         "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Origin": p["Origin"],
         "Referer": p["Referer"],
     }
+    # Pour gabon1ere (requête GET même origine), n'envoyer Origin que sur les requêtes média CDN
+    if profile != "gabon1ere" or not is_api:
+        headers["Origin"] = p["Origin"]
+    return headers
 
 
 def extract_m3u8_urls(data):
@@ -74,20 +77,22 @@ def get_evangiletv_streams():
 
 
 def get_gabon1ere_m3u8():
-    headers = get_headers("gabon1ere", is_api=False)
-    headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    r = requests.get(GABON1ERE_EMBED_URL, headers=headers, timeout=10)
-    r.raise_for_status()
-
-    raw_html = r.text.replace("\\/", "/")
-    matches = list(
-        dict.fromkeys(re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', raw_html))
+    r = requests.get(
+        GABON1ERE_API_URL, headers=get_headers("gabon1ere", is_api=True), timeout=10
     )
-    if not matches:
-        raise RuntimeError(
-            "Aucune URL .m3u8 trouvée directement dans le HTML de Gabon 1ère."
+    r.raise_for_status()
+    try:
+        streams = extract_m3u8_urls(r.json())
+    except ValueError:
+        raw_text = r.text.replace("\\/", "/")
+        streams = list(
+            dict.fromkeys(re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', raw_text))
         )
-    return matches[0]
+    if not streams:
+        raise RuntimeError(
+            f"Aucune URL .m3u8 trouvée dans l'API Gabon 1ère. Aperçu : {r.text[:300]}"
+        )
+    return streams[0]
 
 
 @app.route("/")
