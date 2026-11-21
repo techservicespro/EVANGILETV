@@ -1,6 +1,6 @@
 import re
 from urllib.parse import quote, unquote, urljoin
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, redirect, request
 import requests
 
 app = Flask(__name__)
@@ -22,7 +22,7 @@ PROFILES = {
     },
     "gabon1ere": {
         "Origin": "https://connect.imnet.online",
-        "Referer": "https://connect.imnet.online/watch/gabon_1ere-54e2d65d?embed=1",
+        "Referer": "https://connect.imnet.online/",
     },
 }
 
@@ -36,10 +36,17 @@ def get_headers(profile="evangile", is_api=False):
         ),
         "Accept": "application/json, text/plain, */*" if is_api else "*/*",
         "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": p["Referer"],
     }
-    # Pour gabon1ere (requête GET même origine), n'envoyer Origin que sur les requêtes média CDN
-    if profile != "gabon1ere" or not is_api:
+    if profile == "gabon1ere":
+        headers["Referer"] = (
+            "https://connect.imnet.online/watch/gabon_1ere-54e2d65d?embed=1"
+            if is_api
+            else "https://connect.imnet.online/"
+        )
+        if not is_api:
+            headers["Origin"] = "https://connect.imnet.online"
+    else:
+        headers["Referer"] = p["Referer"]
         headers["Origin"] = p["Origin"]
     return headers
 
@@ -123,6 +130,57 @@ def debug_gabon1ere():
         return jsonify({"status": "error", "detail": str(e)}), 500
 
 
+@app.route("/debug/gabon1ere-headers")
+def debug_gabon1ere_headers():
+    try:
+        m3u8_url = get_gabon1ere_m3u8()
+        candidates = [
+            {
+                "name": "referer_racine_avec_origin",
+                "Referer": "https://connect.imnet.online/",
+                "Origin": "https://connect.imnet.online",
+            },
+            {
+                "name": "referer_racine_sans_origin",
+                "Referer": "https://connect.imnet.online/",
+            },
+            {
+                "name": "referer_watch_avec_origin",
+                "Referer": "https://connect.imnet.online/watch/gabon_1ere-54e2d65d?embed=1",
+                "Origin": "https://connect.imnet.online",
+            },
+            {
+                "name": "referer_watch_sans_origin",
+                "Referer": "https://connect.imnet.online/watch/gabon_1ere-54e2d65d?embed=1",
+            },
+            {"name": "aucun_referer"},
+        ]
+        results = []
+        for c in candidates:
+            h = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                ),
+                "Accept": "*/*",
+            }
+            if "Referer" in c:
+                h["Referer"] = c["Referer"]
+            if "Origin" in c:
+                h["Origin"] = c["Origin"]
+            resp = requests.get(m3u8_url, headers=h, timeout=10)
+            results.append(
+                {
+                    "test": c["name"],
+                    "status": resp.status_code,
+                    "preview": resp.text[:120],
+                }
+            )
+        return jsonify({"m3u8_url": m3u8_url, "tests": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/playlist.m3u")
 def playlist():
     base_url = request.host_url.rstrip("/")
@@ -133,6 +191,7 @@ def playlist():
         '#EXTINF:-1 tvg-id="EVANGILETV2" tvg-name="EVANGILETV (Flux 2)",EVANGILETV (Flux 2)',
         f"{base_url}/EVANGILETV2.m3u8",
         '#EXTINF:-1 tvg-id="GABON1ERE" tvg-name="Gabon 1ère",Gabon 1ère',
+        "#EXTVLCOPT:http-referrer=https://connect.imnet.online/",
         f"{base_url}/GABON1ERE.m3u8",
     ]
     return Response("\n".join(lines) + "\n", mimetype="audio/x-mpegurl")
@@ -164,9 +223,18 @@ def evangiletv_2():
 def gabon1ere():
     try:
         master_url = get_gabon1ere_m3u8()
-        return proxy_m3u8(master_url, profile="gabon1ere")
+        return redirect(master_url, code=302)
     except Exception as e:
         return Response(f"Erreur GABON1ERE : {e}", status=502)
+
+
+@app.route("/GABON1ERE-proxy.m3u8")
+def gabon1ere_proxy():
+    try:
+        master_url = get_gabon1ere_m3u8()
+        return proxy_m3u8(master_url, profile="gabon1ere")
+    except Exception as e:
+        return Response(f"Erreur GABON1ERE-proxy : {e}", status=502)
 
 
 @app.route("/proxy")
