@@ -12,15 +12,31 @@ API_URL = (
     "evangiletv/EvangileTV-website-web-1/live1/stream_info.php"
 )
 
-HEADERS = {
+BASE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     ),
-    "Referer": "https://www.evangiletv.com/",
-    "Origin": "https://www.evangiletv.com",
-    "Accept": "*/*",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
 }
+
+REFERER_CANDIDATES = [
+    None,
+    "https://evangiletv.org/",
+    "https://www.evangiletv.org/",
+    "https://evangile.tv/",
+    "https://www.evangile.tv/",
+    "https://player.hexaglobe.net/",
+]
+
+
+def build_headers(referer=None):
+    h = dict(BASE_HEADERS)
+    if referer:
+        h["Referer"] = referer
+        h["Origin"] = referer.rstrip("/")
+    return h
 
 
 def extract_m3u8_urls(data):
@@ -38,9 +54,22 @@ def extract_m3u8_urls(data):
     return list(dict.fromkeys(urls))
 
 
+def fetch_api_with_fallback():
+    last_error = None
+    for ref in REFERER_CANDIDATES:
+        headers = build_headers(ref)
+        try:
+            r = requests.get(API_URL, headers=headers, timeout=10)
+            if r.status_code == 200:
+                return r, headers
+            last_error = f"HTTP {r.status_code} (Referer={ref})"
+        except Exception as e:
+            last_error = str(e)
+    raise RuntimeError(f"Échec API Hexaglobe : {last_error}")
+
+
 def get_evangiletv_streams():
-    r = requests.get(API_URL, headers=HEADERS, timeout=10)
-    r.raise_for_status()
+    r, working_headers = fetch_api_with_fallback()
     try:
         payload = r.json()
         streams = extract_m3u8_urls(payload)
@@ -51,8 +80,10 @@ def get_evangiletv_streams():
         )
 
     if not streams:
-        raise RuntimeError("Aucune URL .m3u8 trouvée dans la réponse stream_info.php.")
-    return streams
+        raise RuntimeError(
+            f"Aucune URL .m3u8 trouvée. Réponse brute : {r.text[:200]}"
+        )
+    return streams, working_headers
 
 
 @app.route("/")
@@ -66,13 +97,14 @@ def index():
 @app.route("/debug")
 def debug():
     try:
-        streams = get_evangiletv_streams()
+        streams, working_headers = get_evangiletv_streams()
         preview = []
         for idx, url in enumerate(streams, start=1):
-            test = requests.get(url, headers=HEADERS, timeout=10)
+            test = requests.get(url, headers=working_headers, timeout=10)
             preview.append(
                 {
                     "flux": idx,
+                    "referer_retenu": working_headers.get("Referer"),
                     "url_prefix": url[:65] + "...",
                     "http_status": test.status_code,
                     "m3u8_preview": test.text[:250],
@@ -89,7 +121,7 @@ def playlist():
     base_url = request.host_url.rstrip("/")
     lines = ["#EXTM3U"]
     try:
-        streams = get_evangiletv_streams()
+        streams, _ = get_evangiletv_streams()
         for idx in range(1, len(streams) + 1):
             suffix = "" if idx == 1 else f" (Flux {idx})"
             route = "/live.m3u8" if idx == 1 else f"/live{idx}.m3u8"
@@ -109,8 +141,8 @@ def playlist():
 @app.route("/live.m3u8")
 def live_m3u8():
     try:
-        streams = get_evangiletv_streams()
-        return proxy_m3u8(streams[0])
+        streams, working_headers = get_evangiletv_streams()
+        return proxy_m3u8(streams[0], working_headers)
     except Exception as e:
         return Response(f"Erreur flux 1 ({CHANNEL_TITLE}): {e}", status=502)
 
@@ -118,10 +150,10 @@ def live_m3u8():
 @app.route("/live2.m3u8")
 def live2_m3u8():
     try:
-        streams = get_evangiletv_streams()
+        streams, working_headers = get_evangiletv_streams()
         if len(streams) < 2:
             return Response("Deuxième flux non disponible.", status=404)
-        return proxy_m3u8(streams[1])
+        return proxy_m3u8(streams[1], working_headers)
     except Exception as e:
         return Response(f"Erreur flux 2 ({CHANNEL_TITLE}): {e}", status=502)
 
@@ -132,10 +164,11 @@ def proxy():
     if not target_url.startswith("http"):
         return Response("URL invalide", status=400)
 
+    headers = build_headers("https://evangiletv.org/")
     if ".m3u8" in target_url:
-        return proxy_m3u8(target_url)
+        return proxy_m3u8(target_url, headers)
 
-    r = requests.get(target_url, headers=HEADERS, stream=True, timeout=15)
+    r = requests.get(target_url, headers=headers, stream=True, timeout=15)
     return Response(
         r.iter_content(chunk_size=32768),
         status=r.status_code,
@@ -143,8 +176,8 @@ def proxy():
     )
 
 
-def proxy_m3u8(m3u8_url):
-    r = requests.get(m3u8_url, headers=HEADERS, timeout=10)
+def proxy_m3u8(m3u8_url, headers):
+    r = requests.get(m3u8_url, headers=headers, timeout=10)
     r.raise_for_status()
     base_proxy = f"{request.host_url.rstrip('/')}/proxy?url="
 
