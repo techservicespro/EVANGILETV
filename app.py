@@ -1,54 +1,28 @@
 import re
 from urllib.parse import quote, unquote, urljoin
-from flask import Flask, Response, jsonify, redirect, request
+from flask import Flask, Response, jsonify, request
 import requests
 
 app = Flask(__name__)
 
-# --- CONFIGURATION EVANGILE TV (Hexaglobe) ---
 EVANGILE_API_URL = (
     "https://evangiletv-live1-p-api.hexaglobe.net/"
     "cec61441155731421275087a35fc2d98/1795022284/"
     "evangiletv/EvangileTV-website-web-1/live1/stream_info.php"
 )
 
-# --- CONFIGURATION GABON 1ERE (Imnet API JSON) ---
-GABON1ERE_API_URL = "https://connect.imnet.online/api/public/channel/gabon_1ere-54e2d65d"
 
-PROFILES = {
-    "evangile": {
-        "Origin": "https://evangile.tv",
-        "Referer": "https://evangile.tv/",
-    },
-    "gabon1ere": {
-        "Origin": "https://connect.imnet.online",
-        "Referer": "https://connect.imnet.online/",
-    },
-}
-
-
-def get_headers(profile="evangile", is_api=False):
-    p = PROFILES.get(profile, PROFILES["evangile"])
-    headers = {
+def get_headers(is_api=False):
+    return {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         ),
         "Accept": "application/json, text/plain, */*" if is_api else "*/*",
         "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Origin": "https://evangile.tv",
+        "Referer": "https://evangile.tv/",
     }
-    if profile == "gabon1ere":
-        headers["Referer"] = (
-            "https://connect.imnet.online/watch/gabon_1ere-54e2d65d?embed=1"
-            if is_api
-            else "https://connect.imnet.online/"
-        )
-        if not is_api:
-            headers["Origin"] = "https://connect.imnet.online"
-    else:
-        headers["Referer"] = p["Referer"]
-        headers["Origin"] = p["Origin"]
-    return headers
 
 
 def extract_m3u8_urls(data):
@@ -67,9 +41,7 @@ def extract_m3u8_urls(data):
 
 
 def get_evangiletv_streams():
-    r = requests.get(
-        EVANGILE_API_URL, headers=get_headers("evangile", is_api=True), timeout=10
-    )
+    r = requests.get(EVANGILE_API_URL, headers=get_headers(is_api=True), timeout=10)
     r.raise_for_status()
     try:
         streams = extract_m3u8_urls(r.json())
@@ -83,102 +55,13 @@ def get_evangiletv_streams():
     return streams
 
 
-def get_gabon1ere_m3u8():
-    r = requests.get(
-        GABON1ERE_API_URL, headers=get_headers("gabon1ere", is_api=True), timeout=10
-    )
-    r.raise_for_status()
-    try:
-        streams = extract_m3u8_urls(r.json())
-    except ValueError:
-        raw_text = r.text.replace("\\/", "/")
-        streams = list(
-            dict.fromkeys(re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', raw_text))
-        )
-    if not streams:
-        raise RuntimeError(
-            f"Aucune URL .m3u8 trouvée dans l'API Gabon 1ère. Aperçu : {r.text[:300]}"
-        )
-    return streams[0]
-
-
 @app.route("/")
 @app.route("/ping")
 def index():
     return (
-        "Proxy TV actif. Flux disponibles : "
-        "/EVANGILETV.m3u8, /EVANGILETV2.m3u8, /GABON1ERE.m3u8, /playlist.m3u"
+        "Proxy EVANGILETV actif. Flux disponibles : "
+        "/EVANGILETV.m3u8, /EVANGILETV2.m3u8, /playlist.m3u"
     )
-
-
-@app.route("/debug/gabon1ere")
-def debug_gabon1ere():
-    try:
-        m3u8_url = get_gabon1ere_m3u8()
-        test = requests.get(
-            m3u8_url, headers=get_headers("gabon1ere", is_api=False), timeout=10
-        )
-        return jsonify(
-            {
-                "status": "ok",
-                "m3u8_url": m3u8_url,
-                "http_status": test.status_code,
-                "m3u8_preview": test.text[:350],
-            }
-        )
-    except Exception as e:
-        return jsonify({"status": "error", "detail": str(e)}), 500
-
-
-@app.route("/debug/gabon1ere-headers")
-def debug_gabon1ere_headers():
-    try:
-        m3u8_url = get_gabon1ere_m3u8()
-        candidates = [
-            {
-                "name": "referer_racine_avec_origin",
-                "Referer": "https://connect.imnet.online/",
-                "Origin": "https://connect.imnet.online",
-            },
-            {
-                "name": "referer_racine_sans_origin",
-                "Referer": "https://connect.imnet.online/",
-            },
-            {
-                "name": "referer_watch_avec_origin",
-                "Referer": "https://connect.imnet.online/watch/gabon_1ere-54e2d65d?embed=1",
-                "Origin": "https://connect.imnet.online",
-            },
-            {
-                "name": "referer_watch_sans_origin",
-                "Referer": "https://connect.imnet.online/watch/gabon_1ere-54e2d65d?embed=1",
-            },
-            {"name": "aucun_referer"},
-        ]
-        results = []
-        for c in candidates:
-            h = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-                ),
-                "Accept": "*/*",
-            }
-            if "Referer" in c:
-                h["Referer"] = c["Referer"]
-            if "Origin" in c:
-                h["Origin"] = c["Origin"]
-            resp = requests.get(m3u8_url, headers=h, timeout=10)
-            results.append(
-                {
-                    "test": c["name"],
-                    "status": resp.status_code,
-                    "preview": resp.text[:120],
-                }
-            )
-        return jsonify({"m3u8_url": m3u8_url, "tests": results})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/playlist.m3u")
@@ -190,9 +73,6 @@ def playlist():
         f"{base_url}/EVANGILETV.m3u8",
         '#EXTINF:-1 tvg-id="EVANGILETV2" tvg-name="EVANGILETV (Flux 2)",EVANGILETV (Flux 2)',
         f"{base_url}/EVANGILETV2.m3u8",
-        '#EXTINF:-1 tvg-id="GABON1ERE" tvg-name="Gabon 1ère",Gabon 1ère',
-        "#EXTVLCOPT:http-referrer=https://connect.imnet.online/",
-        f"{base_url}/GABON1ERE.m3u8",
     ]
     return Response("\n".join(lines) + "\n", mimetype="audio/x-mpegurl")
 
@@ -202,7 +82,7 @@ def playlist():
 def evangiletv_1():
     try:
         streams = get_evangiletv_streams()
-        return proxy_m3u8(streams[0], profile="evangile")
+        return proxy_m3u8(streams[0])
     except Exception as e:
         return Response(f"Erreur EVANGILETV : {e}", status=502)
 
@@ -214,41 +94,22 @@ def evangiletv_2():
         streams = get_evangiletv_streams()
         if len(streams) < 2:
             return Response("Deuxième flux EVANGILETV non disponible.", status=404)
-        return proxy_m3u8(streams[1], profile="evangile")
+        return proxy_m3u8(streams[1])
     except Exception as e:
         return Response(f"Erreur EVANGILETV2 : {e}", status=502)
-
-
-@app.route("/GABON1ERE.m3u8")
-def gabon1ere():
-    try:
-        master_url = get_gabon1ere_m3u8()
-        return redirect(master_url, code=302)
-    except Exception as e:
-        return Response(f"Erreur GABON1ERE : {e}", status=502)
-
-
-@app.route("/GABON1ERE-proxy.m3u8")
-def gabon1ere_proxy():
-    try:
-        master_url = get_gabon1ere_m3u8()
-        return proxy_m3u8(master_url, profile="gabon1ere")
-    except Exception as e:
-        return Response(f"Erreur GABON1ERE-proxy : {e}", status=502)
 
 
 @app.route("/proxy")
 def proxy():
     target_url = unquote(request.args.get("url", ""))
-    profile = request.args.get("p", "evangile")
     if not target_url.startswith("http"):
         return Response("URL invalide", status=400)
 
     if ".m3u8" in target_url:
-        return proxy_m3u8(target_url, profile=profile)
+        return proxy_m3u8(target_url)
 
     r = requests.get(
-        target_url, headers=get_headers(profile, is_api=False), stream=True, timeout=15
+        target_url, headers=get_headers(is_api=False), stream=True, timeout=15
     )
     return Response(
         r.iter_content(chunk_size=32768),
@@ -257,10 +118,10 @@ def proxy():
     )
 
 
-def proxy_m3u8(m3u8_url, profile="evangile"):
-    r = requests.get(m3u8_url, headers=get_headers(profile, is_api=False), timeout=10)
+def proxy_m3u8(m3u8_url):
+    r = requests.get(m3u8_url, headers=get_headers(is_api=False), timeout=10)
     r.raise_for_status()
-    base_proxy = f"{request.host_url.rstrip('/')}/proxy?p={profile}&url="
+    base_proxy = f"{request.host_url.rstrip('/')}/proxy?url="
 
     rewritten_lines = []
     for line in r.text.splitlines():
