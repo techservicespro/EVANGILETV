@@ -1,15 +1,20 @@
 import re
+import time
 from urllib.parse import quote, unquote, urljoin
 from flask import Flask, Response, jsonify, request
 import requests
 
 app = Flask(__name__)
 
-EVANGILE_API_URL = (
+LIVE_PAGE_URL = "https://evangile.tv/direct-24-7/"
+FALLBACK_API_URL = (
     "https://evangiletv-live1-p-api.hexaglobe.net/"
     "cec61441155731421275087a35fc2d98/1795022284/"
     "evangiletv/EvangileTV-website-web-1/live1/stream_info.php"
 )
+
+# Cache mémoire (10 minutes) pour éviter de re-scanner la page à chaque segment
+STREAM_CACHE = {"streams": [], "expires_at": 0, "source": ""}
 
 
 def get_headers(is_api=False):
@@ -40,8 +45,56 @@ def extract_m3u8_urls(data):
     return list(dict.fromkeys(urls))
 
 
-def get_evangiletv_streams():
-    r = requests.get(EVANGILE_API_URL, headers=get_headers(is_api=True), timeout=10)
+def discover_fresh_source():
+    """Analyse https://evangile.tv/direct-24-7/ et ses iframes pour trouver stream_info.php ou .m3u8."""
+    html_headers = get_headers(is_api=False)
+    html_headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+
+    r = requests.get(LIVE_PAGE_URL, headers=html_headers, timeout=10)
+    r.raise_for_status()
+    page_text = r.text.replace("\\/", "/")
+
+    # 1. Chercher stream_info.php directement dans la page /direct-24-7/
+    api_matches = re.findall(
+        r'https?://[^\s"\'<>]+hexaglobe\.net/[^\s"\'<>]+stream_info\.php[^\s"\'<>]*',
+        page_text,
+    )
+    if api_matches:
+        return ("api", api_matches[0])
+
+    # 2. Chercher une URL .m3u8 directe dans la page
+    m3u8_matches = re.findall(
+        r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*',
+        page_text,
+    )
+    if m3u8_matches:
+        return ("m3u8", list(dict.fromkeys(m3u8_matches)))
+
+    # 3. Chercher dans les iframes (ex. player Hexaglobe) intégrés dans /direct-24-7/
+    iframes = re.findall(r'<iframe[^>]+src=["\'](https?://[^"\']+)["\']', page_text, re.I)
+    for iframe_url in list(dict.fromkeys(iframes)):
+        try:
+            sub_r = requests.get(iframe_url, headers=html_headers, timeout=10)
+            sub_text = sub_r.text.replace("\\/", "/")
+
+            sub_api = re.findall(
+                r'https?://[^\s"\'<>]+hexaglobe\.net/[^\s"\'<>]+stream_info\.php[^\s"\'<>]*',
+                sub_text,
+            )
+            if sub_api:
+                return ("api", sub_api[0])
+
+            sub_m3u8 = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', sub_text)
+            if sub_m3u8:
+                return ("m3u8", list(dict.fromkeys(sub_m3u8)))
+        except Exception:
+            continue
+
+    return ("api", FALLBACK_API_URL)
+
+
+def fetch_streams_from_api(api_url):
+    r = requests.get(api_url, headers=get_headers(is_api=True), timeout=10)
     r.raise_for_status()
     try:
         streams = extract_m3u8_urls(r.json())
@@ -51,7 +104,26 @@ def get_evangiletv_streams():
             dict.fromkeys(re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', raw_text))
         )
     if not streams:
-        raise RuntimeError("Aucune URL .m3u8 trouvée pour EVANGILETV.")
+        raise RuntimeError("Aucune URL .m3u8 trouvée dans stream_info.php.")
+    return streams
+
+
+def get_evangiletv_streams(force_refresh=False):
+    now = time.time()
+    if not force_refresh and STREAM_CACHE["streams"] and now < STREAM_CACHE["expires_at"]:
+        return STREAM_CACHE["streams"]
+
+    kind, target = discover_fresh_source()
+    if kind == "m3u8":
+        streams = target
+        source_label = f"direct depuis {LIVE_PAGE_URL}"
+    else:
+        streams = fetch_streams_from_api(target)
+        source_label = target
+
+    STREAM_CACHE["streams"] = streams
+    STREAM_CACHE["expires_at"] = now + 600
+    STREAM_CACHE["source"] = source_label
     return streams
 
 
@@ -59,9 +131,27 @@ def get_evangiletv_streams():
 @app.route("/ping")
 def index():
     return (
-        "Proxy EVANGILETV actif. Flux disponibles : "
-        "/EVANGILETV.m3u8, /EVANGILETV2.m3u8, /playlist.m3u"
+        "Proxy EVANGILETV actif (source: evangile.tv/direct-24-7/). "
+        "Flux disponibles : /EVANGILETV.m3u8, /EVANGILETV2.m3u8, /playlist.m3u, /debug"
     )
+
+
+@app.route("/debug")
+def debug():
+    try:
+        streams = get_evangiletv_streams(force_refresh=True)
+        test = requests.get(streams[0], headers=get_headers(is_api=False), timeout=10)
+        return jsonify(
+            {
+                "status": "ok",
+                "source_detectee": STREAM_CACHE["source"],
+                "nombre_flux": len(streams),
+                "m3u8_status": test.status_code,
+                "m3u8_preview": test.text[:250],
+            }
+        )
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e)}), 500
 
 
 @app.route("/playlist.m3u")
@@ -83,8 +173,12 @@ def evangiletv_1():
     try:
         streams = get_evangiletv_streams()
         return proxy_m3u8(streams[0])
-    except Exception as e:
-        return Response(f"Erreur EVANGILETV : {e}", status=502)
+    except Exception:
+        try:
+            streams = get_evangiletv_streams(force_refresh=True)
+            return proxy_m3u8(streams[0])
+        except Exception as e:
+            return Response(f"Erreur EVANGILETV : {e}", status=502)
 
 
 @app.route("/EVANGILETV2.m3u8")
